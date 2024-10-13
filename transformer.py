@@ -7,7 +7,7 @@ import numpy as np
 
 import torch
 import torch.nn as nn
-import torch.functional as F
+import torch.nn.functional as F
 
 import copy
 
@@ -83,17 +83,122 @@ class MultiVarInputEncoding(nn.Module):
         return src_encoded_input, tgt_encoded_embeds
 
 
+class MultiVarTransformerEncoder(nn.Module):
+    def __init__(self, input_dim, n_head, ff_dim, attn_dropout, ff_dropout, batch_first = True):
+        super(MultiVarTransformerEncoder, self).__init__()
+        # attention layer
+        self.self_attention = nn.MultiheadAttention(input_dim, n_head, dropout = attn_dropout, batch_first = batch_first)
+        # layer_norm
+        self.layer_norm_1 = nn.LayerNorm(input_dim)
+        
+        # ff layers
+        self.linear_1 = nn.Linear(input_dim, ff_dim)
+        self.linear_2 = nn.Linear(ff_dim, input_dim)
+        # feedforward dropout
+        self.ff_dropout = nn.Dropout(ff_dropout)
+        # layer norm
+        self.layer_norm_2 = nn.LayerNorm(input_dim)
+        
+    def forward(self, src, future_mask, pad_mask):
+        # attention output
+        self_attention, _ = self.self_attention(src, src, src, attn_mask = future_mask, key_padding_mask = pad_mask)
+        # add attn info to source sequence
+        src = src + self_attention
+        # layer norm
+        src = self.layer_norm_1(src)
+        
+        # feedforward layers
+        ff_out = self.linear_2(self.ff_dropout(F.relu(self.linear_1(src))))
+        # add residual connection
+        src = src + ff_out
+        # layer norm
+        src = self.layer_norm_2(src)
+        
+        return src
+    
+    
+class MultiVarTransformerDecoder(nn.Module):
+    def __init__(self, input_dim, n_head, ff_dim, attn_dropout, ff_dropout, batch_first = True):
+        super(MultiVarTransformerDecoder, self).__init__()
+        # attention layer
+        self.self_attention = nn.MultiheadAttention(input_dim, n_head, dropout = attn_dropout, batch_first = batch_first)
+        # layer norm
+        self.layer_norm_1 = nn.LayerNorm(input_dim)
+        # cross attention with encoded input
+        self.cross_attention = nn.MultiheadAttention(input_dim, n_head, dropout = attn_dropout, batch_first = batch_first)
+        # layer norm
+        self.layer_norm_2 = nn.LayerNorm(input_dim)
+        
+        # ff layers
+        self.linear_1 = nn.Linear(input_dim, ff_dim)
+        self.linear_2 = nn.Linear(ff_dim, input_dim)
+        # feedforward dropout
+        self.ff_dropout = nn.Dropout(ff_dropout)
+        # layer norm
+        self.layer_norm_3 = nn.LayerNorm(input_dim)
+        
+    def forward(self, tgt, encoded_src, future_mask, src_pad_mask, tgt_pad_mask):
+        # self attention
+        self_attention, _ = self.self_attention(tgt, tgt, tgt, attn_mask = future_mask, key_padding_mask = tgt_pad_mask)
+        # add attention info to target sequence
+        tgt = tgt + self_attention
+        # layer norm
+        tgt = self.layer_norm_1(tgt)
+        
+        # cross attention
+        cross_attention, _ = self.cross_attention(tgt, encoded_src, encoded_src, attn_mask = future_mask, key_padding_mask = src_pad_mask)
+        # add cross attention to target sequence
+        tgt = tgt + cross_attention
+        # layer norm
+        tgt = self.layer_norm_2(tgt)
+        
+        # feedforward layers
+        ff_out = self.linear_2(self.ff_dropout(F.relu(self.linear_1(tgt))))
+        # residual connection
+        tgt = tgt + ff_out
+        # layer norm
+        tgt = self.layer_norm_3(tgt)
+        
+        return tgt
+    
+
 class MultiVarTransformer(nn.Module):
-    def __init__(self, n_unique_tokens, n_features, seq_len, n_embed_dims = 64, n_heads = 8, n_layers = 4, ff_dim = 1024, padding_token = None):
+    def __init__(self, 
+                 n_unique_tokens, 
+                 n_features, 
+                 seq_len, 
+                 n_embed_dims = 64, 
+                 n_heads = 8, 
+                 n_layers = 4, 
+                 ff_dim = 1024, 
+                 embed_dropout = 0.1,
+                 attn_dropout = 0.2,
+                 ff_dropout = 0.3,
+                 padding_token = None):
         super(MultiVarTransformer, self).__init__()
         
         self.n_unique_tokens = n_unique_tokens
         self.padding_token = padding_token
         
         # input embedding encoding 
-        self.input_encoder = MultiVarInputEncoding(n_unique_tokens, n_embed_dims, n_features, seq_len, padding_token)
+        self.input_encoder = MultiVarInputEncoding(n_unique_tokens, n_embed_dims, n_features, seq_len, 
+                                                   padding_token, dropout = embed_dropout)
         # transformer layer
-        self.transformer = nn.Transformer(n_embed_dims * n_features, n_heads, n_layers, n_layers, ff_dim, batch_first = True)
+        # self.transformer = nn.Transformer(n_embed_dims * n_features, n_heads, n_layers, n_layers, ff_dim, 
+        #                                   batch_first = True, dropout = attn_dropout)
+        
+        # # transformer encoder
+        # encoder_layer = nn.TransformerEncoderLayer(n_embed_dims * n_features, n_heads, ff_dim, attn_dropout)
+        # encoder = nn.TransformerEncoder(encoder_layer, n_layers)
+        # # transformer decoder
+        # decoder_layer = nn.TransformerDecoderLayer(n_embed_dims * n_features, n_heads, ff_dim, attn_dropout)
+        # decoder = nn.TransformerDecoder(encoder_layer, n_layers)
+        
+        # transformer encoder
+        self.transformer_encoder = MultiVarTransformerEncoder(n_embed_dims * n_features, n_heads, ff_dim, attn_dropout, ff_dropout)
+        # transformer decoder
+        self.transformer_decoder = MultiVarTransformerDecoder(n_embed_dims * n_features, n_heads, ff_dim, attn_dropout, ff_dropout)
+        
         # output layer
         self.output_linear = nn.Linear(n_embed_dims * n_features, n_unique_tokens * n_features)
         
@@ -102,8 +207,8 @@ class MultiVarTransformer(nn.Module):
         if self.padding_token is not None:
             src_pad_mask = (src == self.padding_token).all(dim=2).float()
             tgt_pad_mask = (tgt == self.padding_token).all(dim=2).float()
-            src_pad_mask = src_pad_mask.masked_fill(src_pad_mask == 1., float('-inf')) 
-            tgt_pad_mask = tgt_pad_mask.masked_fill(tgt_pad_mask == 1., float('-inf')) 
+            src_pad_mask = src_pad_mask.masked_fill((tgt_pad_mask == 1.), float('-inf')) 
+            tgt_pad_mask = tgt_pad_mask.masked_fill((tgt_pad_mask == 1.), float('-inf')) 
         else:
             src_pad_mask = None
             tgt_pad_mask = None
@@ -114,56 +219,35 @@ class MultiVarTransformer(nn.Module):
         # get shape (batch, timesteps, features)
         b, t, f = src.shape
         
-        # apply input encoding: (b, t, f) -> (b, t, f * e)
-        encoded_src, encoded_tgt = self.input_encoder(src, tgt)
+        # apply input embedding + pos encoding: (b, t, f) -> (b, t, f * e)
+        encoded_input_src, encoded_input_tgt = self.input_encoder(src, tgt)
         
         # create non-lookahead mask
-        non_lookahead_mask = self.transformer.generate_square_subsequent_mask(t)
+        non_lookahead_mask = nn.Transformer.generate_square_subsequent_mask(t)
         # get padding masks
         src_pad_mask, tgt_pad_mask = self.get_padding_masks(src, tgt)
             
-        # apply transformer: -> (b, t, e)
-        output = self.transformer(encoded_src, 
-                                  encoded_tgt, 
-                                  tgt_mask = non_lookahead_mask,
-                                  src_key_padding_mask = src_pad_mask,
-                                  tgt_key_padding_mask = tgt_pad_mask)
+        # # apply transformer: -> (b, t, e)
+        # output = self.transformer(encoded_src, 
+        #                           encoded_tgt, 
+        #                           tgt_mask = non_lookahead_mask,
+        #                           src_key_padding_mask = src_pad_mask,
+        #                           tgt_key_padding_mask = tgt_pad_mask)
+        
+        # apply encoder 
+        encoded_src = self.transformer_encoder(encoded_input_src, 
+                                               non_lookahead_mask, 
+                                               src_pad_mask)
+        # apply decoder: -> (b, t, e)
+        output =  self.transformer_decoder(encoded_input_tgt, 
+                                           encoded_src, 
+                                           non_lookahead_mask, 
+                                           src_pad_mask, 
+                                           tgt_pad_mask)
+    
         # output layer: -> (b, t, n_unique * f)
         output = self.output_linear(output)
         # rescale: -> (b, n_unique, t, f), this shape for CrossEntr.Loss
         output = output.view((b, self.n_unique_tokens, t, f))
         
         return output
-
-# class MultiVarTransformerEncoder(nn.Module):
-#     def __init__(self, n_unique_tokens, n_embed_dims, n_features, seq_len):
-#         super(MultiVarTransformerEncoder, self).__init__()
-        
-#         self.n_features = n_features
-#         self.n_unique_tokens = n_unique_tokens
-        
-#         # transformer layer
-#         self.transformer = nn.Transformer(n_embed_dims, 8, 4, 4, 1024)
-#         # output layer
-#         self.output_linear = nn.Linear(n_embed_dims, n_unique_tokens * n_features)
-        
-#     def forward(self, src, tgt):
-#         # apply transformer: (b, t, f * e) -> (b, t, e)
-#         output = self.transformer(src, tgt)
-#         # output layer: -> (b, t, n_unique * f)
-#         output = self.output_linear(output)
-#         # rescale: -> (b, t, f, n_unique)
-#         b, t, _ = output.shape
-#         output = output.view((b, t, self.n_features, self.n_unique_tokens))
-        
-#         return output
-        
-        
-            
-# class MultiVarTransformerDecoder(nn.Module):
-#     def __init__(self):
-#         super(MultiVarTransformerDecoder, self).__init__()
-
-#     def forward(self):
-#         pass        
-        
